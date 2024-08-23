@@ -21,57 +21,91 @@ app.add_middleware(
     allow_headers=["*"],  # 모든 헤더를 허용합니다.
 )
 
-# BART 모델 및 토크나이저 로드
-model_name = 'facebook/bart-large'
-tokenizer = BartTokenizer.from_pretrained(model_name)
-model = BartForConditionalGeneration.from_pretrained(model_name)
+# 사용자 에이전트 설정
+wikipedia.set_lang("ko")
+wikipedia.set_user_agent("MyApp/1.0 (dldks1212@gmail.com)")
 
-# 문서 데이터베이스 (위키백과에서 가져온 문서들)
-documents = [
-    get_wikipedia_content("Artificial Intelligence"),
-    get_wikipedia_content("Natural Language Processing"),
-    # 추가 문서들...
-]
+# Tokenizer 및 모델 로드
+tokenizer = BartTokenizer.from_pretrained("facebook/bart-large")
+model = BartForConditionalGeneration.from_pretrained("facebook/bart-large")
 
-# 임베딩 생성
-def create_embeddings(texts):
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
-    with torch.no_grad():
-        embeddings = model.get_encoder()(inputs['input_ids'])[0]
-    return embeddings
+# 문서 데이터베이스 초기화
+documents = []
+document_titles = []
 
-# 문서 임베딩 생성
-document_embeddings = create_embeddings(documents)
-index = faiss.IndexFlatL2(document_embeddings.size(-1))
-index.add(document_embeddings.numpy())
+def get_wikipedia_pages(query, max_pages=5):
+    """위키백과에서 검색어로 관련된 페이지 목록 가져오기"""
+    search_results = wikipedia.search(query, results=max_pages)
+    return search_results
 
-# Pydantic 모델 정의
-class QueryRequest(BaseModel):
-    query: str
+def get_wikipedia_content(title):
+    """위키백과에서 특정 페이지의 내용을 가져오기"""
+    try:
+        page = wikipedia.page(title)
+        return page.content
+    except wikipedia.exceptions.DisambiguationError as e:
+        # 여러 페이지가 발견된 경우 첫 번째 페이지 선택
+        return wikipedia.page(e.options[0]).content
+    except wikipedia.exceptions.PageError:
+        return None
+
+def update_document_database(query):
+    """검색어와 관련된 위키백과 페이지 내용을 문서 데이터베이스에 추가하기"""
+    titles = get_wikipedia_pages(query)
+    for title in titles:
+        content = get_wikipedia_content(title)
+        if content:
+            documents.append(content)
+            document_titles.append(title)
+
+# 문서 임베딩 생성 및 검색 인덱스 초기화
+def create_faiss_index():
+    """문서 임베딩을 생성하고 FAISS 인덱스 초기화"""
+    global documents
+    embeddings = []
+    for doc in documents:
+        inputs = tokenizer(doc, return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
+            outputs = model.encoder(**inputs)
+            embeddings.append(outputs.last_hidden_state.mean(dim=1).numpy())
+    embeddings = np.vstack(embeddings)
+    
+    global index
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+
+# FastAPI 서버 및 엔드포인트 설정
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Query(BaseModel):
+    text: str
 
 @app.post("/generate")
-async def generate_text(request: QueryRequest):
-    query = request.query
-    query_tokens = tokenizer(query, return_tensors='pt')
-    
-    with torch.no_grad():
-        query_embedding = model.model.encoder(**query_tokens).last_hidden_state.mean(dim=1).numpy()
-
-    k = 1
-    distances, indices = index.search(query_embedding, k)
-    
-    if len(indices) == 0:
-        raise HTTPException(status_code=404, detail="No relevant documents found.")
-
-    retrieved_doc = documents[indices[0][0]]
-    
-    input_text = f"{retrieved_doc} {query}"
-    input_tokens = tokenizer(input_text, return_tensors='pt')
-    summary_ids = model.generate(input_tokens['input_ids'], num_beams=4, max_length=50, early_stopping=True)
-    
-    output_text = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    
-    return {"result": output_text}
+def generate_summary(query: Query):
+    try:
+        update_document_database(query.text)
+        create_faiss_index()
+        
+        # 문서 검색
+        inputs = tokenizer(query.text, return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
+            outputs = model.encoder(**inputs)
+            query_embedding = outputs.last_hidden_state.mean(dim=1).numpy()
+        
+        distances, indices = index.search(query_embedding, k=1)
+        if len(indices[0]) > 0:
+            relevant_document = documents[indices[0][0]]
+            inputs = tokenizer(relevant_document, return_tensors="pt", padding=True, truncation=True)
+            summary_ids = model.generate(inputs['input_ids'])
+            summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+            return {"result": summary}
+        else:
+            return {"result": "No relevant document found."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # FastAPI 서버 실행 명령 (실행하려면 아래 코드 블록을 사용하지 말고 'uvicorn app:app --reload' 명령어를 사용하세요)
 # if __name__ == "__main__":

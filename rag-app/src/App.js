@@ -8,7 +8,9 @@ function App() {
 
   const handleSearch = async () => {
     try {
-      const response = await axios.post('http://localhost:8000/generate', { query });
+      const response = await axios.post('http://localhost:8000/generate', {
+        text: query, // 요청 본문에 text 필드 추가
+      });
       setResult(response.data.result);
     } catch (error) {
       console.error("Error fetching the result:", error);
